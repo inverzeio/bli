@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-bli = "cli:cli"
+bli = "bli.cli:cli"
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
