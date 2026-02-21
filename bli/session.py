@@ -2,41 +2,55 @@
 
 from __future__ import annotations
 
+import asyncio
 import webbrowser
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-from .client import BrowserlingClient, BrowserlingClientError, SessionToken
+import httpx
+from pydantic import BaseModel, HttpUrl
+
+from .client import BrowserlingClient, BrowserlingClientError
 
 
-# Browsers and OSes Browserling supports.
 SUPPORTED_BROWSERS = ("chrome", "firefox", "edge", "ie")
 SUPPORTED_OSES = ("windows", "macos", "linux")
 
 
-@dataclass
-class DetonationResult:
+class DetonationResult(BaseModel):
     url: str
     browser: str
     browser_version: str
     os_name: str
     os_version: str
-    session_token: str
-    session_url: str
-    detonated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    session_token: str = ""
+    session_url: Optional[HttpUrl] = None
+    detonated_at: datetime = None  # set in model_post_init
     error: Optional[str] = None
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    def model_post_init(self, __context: object) -> None:
+        if self.detonated_at is None:
+            object.__setattr__(self, "detonated_at", datetime.now(timezone.utc))
 
     @property
     def success(self) -> bool:
         return self.error is None
 
+    def session_url_str(self) -> str:
+        return str(self.session_url) if self.session_url else ""
+
 
 class DetonationSession:
-    """Manages the lifecycle of a Browserling URL detonation."""
+    """Manages the lifecycle of Browserling URL detonations."""
 
     def __init__(self, client: BrowserlingClient) -> None:
         self._client = client
+
+    # ------------------------------------------------------------------
+    # Synchronous single detonation
+    # ------------------------------------------------------------------
 
     def detonate(
         self,
@@ -48,32 +62,12 @@ class DetonationSession:
         os_version: str = "10",
         open_locally: bool = True,
     ) -> DetonationResult:
-        """Submit a URL for detonation in a sandboxed Browserling session.
+        """Submit a URL for detonation in a sandboxed Browserling session."""
+        _validate(browser=browser, os_name=os_name)
 
-        Parameters
-        ----------
-        url:
-            The suspicious URL to open.
-        browser:
-            Browser to use. One of: ``chrome``, ``firefox``, ``edge``, ``ie``.
-        browser_version:
-            Browser version (e.g. ``"latest"`` or ``"11"`` for IE 11).
-        os_name:
-            Operating system. One of: ``windows``, ``macos``, ``linux``.
-        os_version:
-            OS version string (e.g. ``"10"`` for Windows 10).
-        open_locally:
-            If ``True``, open the session URL in the analyst's local browser
-            so they can observe the detonation in real time.
-
-        Returns
-        -------
-        DetonationResult
-        """
-        self._validate(browser=browser, os_name=os_name)
-
-        token: Optional[SessionToken] = None
-        error: Optional[str] = None
+        session_token = ""
+        session_url = None
+        error = None
 
         try:
             token = self._client.request_session_token(
@@ -83,6 +77,8 @@ class DetonationSession:
                 os_name=os_name,
                 os_version=os_version,
             )
+            session_token = token.token
+            session_url = token.session_url
         except BrowserlingClientError as exc:
             error = str(exc)
 
@@ -92,17 +88,21 @@ class DetonationSession:
             browser_version=browser_version,
             os_name=os_name,
             os_version=os_version,
-            session_token=token.token if token else "",
-            session_url=token.session_url if token else "",
+            session_token=session_token,
+            session_url=session_url,
             error=error,
         )
 
         if result.success and open_locally:
-            webbrowser.open(result.session_url)
+            webbrowser.open(result.session_url_str())
 
         return result
 
-    def detonate_batch(
+    # ------------------------------------------------------------------
+    # Async concurrent batch detonation
+    # ------------------------------------------------------------------
+
+    async def detonate_batch_async(
         self,
         urls: list[str],
         *,
@@ -112,28 +112,83 @@ class DetonationSession:
         os_version: str = "10",
         open_locally: bool = True,
     ) -> list[DetonationResult]:
-        """Detonate multiple URLs sequentially."""
-        return [
-            self.detonate(
-                url,
+        """Detonate multiple URLs concurrently using asyncio.
+
+        All session token requests are fired in parallel via a shared
+        ``httpx.AsyncClient``. Results are returned in the same order
+        as the input ``urls`` list.
+        """
+        _validate(browser=browser, os_name=os_name)
+
+        async with httpx.AsyncClient(timeout=self._client.config.timeout) as http:
+            tasks = [
+                self._detonate_one_async(
+                    url,
+                    browser=browser,
+                    browser_version=browser_version,
+                    os_name=os_name,
+                    os_version=os_version,
+                    http=http,
+                )
+                for url in urls
+            ]
+            results: list[DetonationResult] = await asyncio.gather(*tasks)
+
+        if open_locally:
+            for r in results:
+                if r.success:
+                    webbrowser.open(r.session_url_str())
+
+        return list(results)
+
+    async def _detonate_one_async(
+        self,
+        url: str,
+        *,
+        browser: str,
+        browser_version: str,
+        os_name: str,
+        os_version: str,
+        http: httpx.AsyncClient,
+    ) -> DetonationResult:
+        session_token = ""
+        session_url = None
+        error = None
+
+        try:
+            token = await self._client.request_session_token_async(
+                url=url,
                 browser=browser,
                 browser_version=browser_version,
                 os_name=os_name,
                 os_version=os_version,
-                open_locally=open_locally,
+                http=http,
             )
-            for url in urls
-        ]
+            session_token = token.token
+            session_url = token.session_url
+        except BrowserlingClientError as exc:
+            error = str(exc)
 
-    @staticmethod
-    def _validate(*, browser: str, os_name: str) -> None:
-        if browser not in SUPPORTED_BROWSERS:
-            raise ValueError(
-                f"Unsupported browser '{browser}'. "
-                f"Choose from: {', '.join(SUPPORTED_BROWSERS)}"
-            )
-        if os_name not in SUPPORTED_OSES:
-            raise ValueError(
-                f"Unsupported OS '{os_name}'. "
-                f"Choose from: {', '.join(SUPPORTED_OSES)}"
-            )
+        return DetonationResult(
+            url=url,
+            browser=browser,
+            browser_version=browser_version,
+            os_name=os_name,
+            os_version=os_version,
+            session_token=session_token,
+            session_url=session_url,
+            error=error,
+        )
+
+
+def _validate(*, browser: str, os_name: str) -> None:
+    if browser not in SUPPORTED_BROWSERS:
+        raise ValueError(
+            f"Unsupported browser '{browser}'. "
+            f"Choose from: {', '.join(SUPPORTED_BROWSERS)}"
+        )
+    if os_name not in SUPPORTED_OSES:
+        raise ValueError(
+            f"Unsupported OS '{os_name}'. "
+            f"Choose from: {', '.join(SUPPORTED_OSES)}"
+        )

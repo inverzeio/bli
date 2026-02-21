@@ -2,71 +2,81 @@
 
 ## Project Overview
 
-`bli` is a Python CLI tool for **security URL detonation** using the [Browserling Live API](https://www.browserling.com/api). It lets analysts submit suspicious URLs to be opened inside sandboxed, isolated Browserling browser sessions — without ever touching the analyst's own machine.
+`bli` is a Python CLI for **security URL detonation** using the
+[Browserling Live API](https://www.browserling.com/api). It opens suspicious
+URLs inside isolated, sandboxed browser sessions — safely away from the
+analyst's own machine.
 
 ## Architecture
 
 ```
-cli.py          ← Click-based CLI entry point
+cli.py              ← Click-based CLI (detonate / detonate-batch)
 bli/
-  client.py     ← Browserling API client (session token requests)
-  session.py    ← Session lifecycle management and URL construction
+  config.py         ← Pydantic BaseSettings (loads from env / .env)
+  client.py         ← Browserling API client (sync + async token requests)
+  session.py        ← Detonation lifecycle; async batch via asyncio.gather
 ```
 
 ## Key Concepts
 
 **Session flow (two steps):**
-1. **Server-side**: Request a one-time session token from Browserling (`GET /liveapi_v1_session`, authenticated with `Browserling-Api-Key` header)
-2. **Client-side**: Use the token to construct/open a live browser session URL pointing to the target
+1. **Server-side**: `GET /liveapi_v1_session` with `Browserling-Api-Key` header
+   → one-time `SessionToken` (Pydantic model)
+2. **Client-side**: use `session_url` to open the sandboxed browser
 
-**Authentication**: API key loaded from `BROWSERLING_API_KEY` env var (or `.env` file).
+**Batch concurrency**: `detonate-batch` fires all token requests in parallel
+via `asyncio.gather` + a shared `httpx.AsyncClient`, then opens the sessions
+sequentially (if `--no-open` is not set).
+
+**Pydantic models**:
+- `BrowserlingConfig` (BaseSettings) — env-driven config, `SecretStr` for key
+- `SessionToken` — validated API response
+- `DetonationResult` — per-URL outcome, serialisable to JSON
 
 ## Environment Variables
 
-| Variable | Required | Description |
-|---|---|---|
-| `BROWSERLING_API_KEY` | Yes | Your Browserling Live API key |
-| `BLI_DEFAULT_BROWSER` | No | Default browser (`chrome`, `firefox`, `ie`, `edge`). Default: `chrome` |
-| `BLI_DEFAULT_OS` | No | Default OS (`windows`, `macos`, `linux`). Default: `windows` |
-| `BLI_OPEN_IN_BROWSER` | No | Auto-open session URL locally (`true`/`false`). Default: `true` |
+All prefixed with `BROWSERLING_` (loaded automatically by `BrowserlingConfig`):
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `BROWSERLING_API_KEY` | Yes | — | Browserling Live API key |
+| `BROWSERLING_DEFAULT_BROWSER` | No | `chrome` | Default browser |
+| `BROWSERLING_DEFAULT_OS` | No | `windows` | Default OS |
+| `BROWSERLING_TIMEOUT` | No | `15.0` | HTTP timeout in seconds |
 
 ## Development Setup
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+# Install uv if needed
+curl -Ls https://astral.sh/uv/install.sh | sh
+
+# Create venv and install deps
+uv venv
+uv pip install -e .
+
 cp .env.example .env
-# Edit .env and add your BROWSERLING_API_KEY
+# Edit .env — set BROWSERLING_API_KEY
 ```
 
 ## Running
 
 ```bash
 # Detonate a single URL
-python cli.py detonate https://suspicious-url.example.com
+uv run bli detonate https://suspicious-url.example.com
 
-# Detonate with specific browser/OS
-python cli.py detonate https://example.com --browser firefox --os macos
+# Detonate with a specific browser/OS
+uv run bli detonate https://example.com --browser firefox --os macos
 
-# Detonate multiple URLs from a file (one per line)
-python cli.py detonate-batch urls.txt
+# Batch detonate (concurrent)
+uv run bli detonate-batch urls.txt
 
-# Show session info without opening
-python cli.py detonate https://example.com --no-open
+# Batch — print session URLs only, don't open locally
+uv run bli detonate-batch iocs.txt --no-open
 ```
 
-## Testing
+## Linting
 
 ```bash
-# Run with a known safe URL to verify your API key works
-python cli.py detonate https://example.com
-```
-
-## Linting / Formatting
-
-```bash
-pip install ruff
-ruff check .
-ruff format .
+uv run ruff check .
+uv run ruff format .
 ```
