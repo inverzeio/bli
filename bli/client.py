@@ -3,16 +3,35 @@
 from __future__ import annotations
 
 import httpx
-from pydantic import BaseModel, HttpUrl, field_validator
+from pydantic import BaseModel, HttpUrl, field_validator, model_validator
 
 from .config import BrowserlingConfig
 
 BROWSERLING_SESSION_ENDPOINT = "https://www.browserling.com/liveapi_v1_session"
 
 
+_SESSION_URL_TEMPLATE = "https://www.browserling.com/l/{token}"
+
+
 class SessionToken(BaseModel):
     token: str
     session_url: HttpUrl
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalise(cls, data: object) -> object:
+        """Accept the actual API response shape ``{"session": "..."}``."""
+        if not isinstance(data, dict):
+            return data
+        if "session" in data and "token" not in data:
+            data = dict(data)
+            data["token"] = data.pop("session")
+        if "token" in data and "session_url" not in data:
+            data.setdefault(
+                "session_url",
+                _SESSION_URL_TEMPLATE.format(token=data["token"]),
+            )
+        return data
 
     @field_validator("token")
     @classmethod
